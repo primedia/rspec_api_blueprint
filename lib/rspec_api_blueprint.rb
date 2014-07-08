@@ -1,76 +1,148 @@
 require "rspec_api_blueprint/version"
 require "rspec_api_blueprint/string_extensions"
 
+module Rspec
+  module API
+    class Blueprint
+      attr_accessor :authorization_header, :request, :response, :action, :example
+
+      class << self
+
+        def root_path
+          if defined? Rails
+            File.join(Rails.root, '/api_docs/')
+          else
+            File.join(File.expand_path('.'), '/api_docs/')
+          end
+        end
+
+        def clean_api_docs_folder(folder_path = root_path)
+          Dir.mkdir(folder_path) unless Dir.exists?(folder_path)
+
+          Dir.glob(File.join(folder_path, '*')).each do |f|
+            File.delete(f)
+          end
+        end
+
+      end
+
+      def initialize(example, request, response)
+        @example, @request, @response = example, request, response
+        @authorization_header = extract_auth_header(request)
+      end
+
+      def output_file(file_name = get_file_name)
+        if defined? Rails
+          File.join(Rails.root, "/api_docs/#{file_name}.txt")
+        else
+          File.join(File.expand_path('.'), "/api_docs/#{file_name}.txt")
+          end
+      end
+
+      def example_groups
+        # TODO: document that this is specific to the describe block structure
+
+        group = example.metadata[:example_group]
+        [group[:description_args], group[:example_group][:description_args]].flatten
+      end
+
+      def action
+        String(example_groups[-2])
+      end
+
+      def get_file_name
+        example_groups[-1].match(/(\w+)\s+Requests/i)[1].underscore
+      end
+
+      def header
+        "# #{action}"
+      end
+
+      def content_type
+        "+ Request #{request.content_type}"
+      end
+
+      def headers
+        "+ Headers"
+      end
+
+      def authorization_header_block
+        if authorization_header.present?
+          [headers.indent(4), "Authorization: #{authorization_header}"].join
+        end
+      end
+
+      def body_header
+        "+ Body".indent(4) if authorization_header
+      end
+
+      def request_body_string(req_body)
+        "#{JSON.pretty_generate(JSON.parse(req_body))}"
+      end
+
+      def response_header
+        "+ Response #{response.status} #{response.content_type}"
+      end
+
+      def response_body
+        if response.body.present? && response.content_type.to_s[/application\/json/]
+          "#{JSON.pretty_generate(JSON.parse(response.body))}".indent(8)
+        end
+      end
+
+      def request_body_block
+        request_body = request.body.read
+        if request_body.present? && request.content_type == 'application/json'
+          output << body_header
+          output << request_body(request_body).indent(authorization_header ? 12 : 8)
+        end
+      end
+
+      def extract_auth_header(request)
+        request.env ? request.env['Authorization'] : request.headers['Authorization']
+      end
+
+      def request_report
+        if request.body.read.present? || authorization_header.present?
+          [
+            content_type,
+            authorization_header,
+            request_body_block,
+          ]
+        end
+      end
+
+      def presenter(*methods)
+        output = methods.map do |m|
+                   send(m.to_sym)
+                 end
+
+        output.flatten.map do |chunk|
+          String(chunk)
+        end.reject(&:empty?).join("\n\n").insert(-1, "\n\n")
+      end
+    end
+  end
+end
+
+include Rspec::API
 
 RSpec.configure do |config|
   config.before(:suite) do
-    if defined? Rails
-      api_docs_folder_path = File.join(Rails.root, '/api_docs/')
-    else
-      api_docs_folder_path = File.join(File.expand_path('.'), '/api_docs/')
-    end
-
-    Dir.mkdir(api_docs_folder_path) unless Dir.exists?(api_docs_folder_path)
-
-    Dir.glob(File.join(api_docs_folder_path, '*')).each do |f|
-      File.delete(f)
-    end
+    Blueprint.clean_api_docs_folder
   end
 
   config.after(:each, type: :request) do
-    response ||= last_response
-    request ||= last_request
+    response ||= (@response || last_response)
+    request ||= (@request || last_request)
 
-    if response
-      example_group = example.metadata[:example_group]
-      example_groups = []
+    return unless response
+    return if [401, 301, 403].include?(response.status)
 
-      while example_group
-        example_groups << example_group
-        example_group = example_group[:example_group]
-      end
+    blueprint = Blueprint.new(example, request, response)
 
-      action = example_groups[-2][:description_args].first if example_groups[-2]
-      example_groups[-1][:description_args].first.match(/(\w+)\sRequests/)
-      file_name = $1.underscore
+    output = blueprint.presenter(:header, :request_report, :response_header, :response_body)
 
-      if defined? Rails
-        file = File.join(Rails.root, "/api_docs/#{file_name}.txt")
-      else
-        file = File.join(File.expand_path('.'), "/api_docs/#{file_name}.txt")
-      end
-
-      File.open(file, 'a') do |f|
-        # Resource & Action
-        f.write "# #{action}\n\n"
-
-        # Request
-        request_body = request.body.read
-        authorization_header = request.env ? request.env['Authorization'] : request.headers['Authorization']
-
-        if request_body.present? || authorization_header.present?
-          f.write "+ Request #{request.content_type}\n\n"
-
-          # Request Headers
-          if authorization_header.present?
-            f.write "+ Headers\n\n".indent(4)
-            f.write "Authorization: #{authorization_header}\n\n".indent(12)
-          end
-
-          # Request Body
-          if request_body.present? && request.content_type == 'application/json'
-            f.write "+ Body\n\n".indent(4) if authorization_header
-            f.write "#{JSON.pretty_generate(JSON.parse(request_body))}\n\n".indent(authorization_header ? 12 : 8)
-          end
-        end
-
-        # Response
-        f.write "+ Response #{response.status} #{response.content_type}\n\n"
-
-        if response.body.present? && response.content_type =~ /application\/json/
-          f.write "#{JSON.pretty_generate(JSON.parse(response.body))}\n\n".indent(8)
-        end
-      end unless response.status == 401 || response.status == 403 || response.status == 301
-    end
+    File.write(blueprint.output_file, output)
   end
 end
